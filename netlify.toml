@@ -1,0 +1,6 @@
+[build]
+  command = "npm ci && npm run build"
+
+[dev]
+  command = "npm run dev"
+  port = 3022
