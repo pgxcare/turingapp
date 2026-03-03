@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+.next/
+out/
+.env*
+outputs/
+*.mp4
+*.wav
+*.aiff
+tsconfig.tsbuildinfo
