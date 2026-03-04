@@ -6,12 +6,14 @@ const nextConfig = {
     if (!internalApiBase) {
       return [];
     }
-    return [
-      {
-        source: '/api/v1/:path*',
-        destination: `${internalApiBase}/:path*`,
-      },
-    ];
+    return {
+      fallback: [
+        {
+          source: '/api/v1/:path*',
+          destination: `${internalApiBase}/:path*`
+        }
+      ]
+    };
   },
 };
 

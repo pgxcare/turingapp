@@ -16,7 +16,7 @@ import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/toast';
-import { api } from '@/lib/api';
+import { API_BASE, api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { isWriteEnabledDemoRole, writeEnabledDemoRoleLabel } from '@/lib/roles';
 import { useQueryResource } from '@/lib/use-query-resource';
@@ -50,6 +50,61 @@ type Change = {
     delta_ppv_proxy_pct?: number;
     sample_size?: number;
   };
+};
+
+type RoiSnapshot = {
+  predictions_total: number;
+  alerts_total: number;
+  non_allow_total: number;
+  alert_rate_pct: number;
+  non_allow_rate_pct: number;
+  ppv_proxy_pct: number;
+  mean_score: number;
+};
+
+type RoiArtifacts = {
+  report_type: 'roi_artifacts';
+  generated_at: string;
+  window: {
+    start_time: string | null;
+    end_time: string | null;
+    split_time: string | null;
+  };
+  kpi_before: RoiSnapshot;
+  kpi_after: RoiSnapshot;
+  kpi_delta: Record<string, number>;
+  incidents: Array<{
+    id: string;
+    title: string;
+    status: string;
+    severity: string;
+    model_id: string;
+    created_at: string | null;
+  }>;
+  change_log: Array<{
+    id: string;
+    title: string;
+    status: string;
+    model_id: string;
+    current_threshold: number;
+    proposed_threshold: number;
+    created_at: string | null;
+  }>;
+};
+
+type CasePacket = {
+  packet_type: 'case_packet';
+  generated_at: string;
+  change: {
+    id: string;
+    title: string;
+    model_id: string;
+    status: string;
+    current_threshold: number;
+    proposed_threshold: number;
+  };
+  evidence_bundle: Record<string, unknown>;
+  roi_artifacts: RoiArtifacts | null;
 };
 
 type ProposalOutcome = 'ALLOW' | 'CAUTION' | 'ABSTAIN' | 'HOLD';
@@ -137,6 +192,33 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function dateInputValue(daysOffset: number): string {
+  const now = new Date();
+  now.setDate(now.getDate() + daysOffset);
+  return now.toISOString().slice(0, 10);
+}
+
+function isoRangeStart(value: string): string | null {
+  if (!value) return null;
+  const parsed = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+function isoRangeEnd(value: string): string | null {
+  if (!value) return null;
+  const parsed = new Date(`${value}T23:59:59`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+function formatRoiDateLabel(value: string | null): string {
+  if (!value) return '-';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '-';
+  return parsed.toLocaleString();
+}
+
 function ChangePageContent() {
   const { user } = useAuth();
   const modelsQuery = useQueryResource<Model[]>(() => api.get('/models'));
@@ -156,6 +238,13 @@ function ChangePageContent() {
   const [isSimulating, setIsSimulating] = useState(false);
   const [transitioningTo, setTransitioningTo] = useState<string>('');
   const [isExporting, setIsExporting] = useState(false);
+  const [isCasePacketExporting, setIsCasePacketExporting] = useState(false);
+  const [roiStartDate, setRoiStartDate] = useState(() => dateInputValue(-30));
+  const [roiEndDate, setRoiEndDate] = useState(() => dateInputValue(0));
+  const [roiArtifacts, setRoiArtifacts] = useState<RoiArtifacts | null>(null);
+  const [isRoiLoading, setIsRoiLoading] = useState(false);
+  const [isRoiExportingCsv, setIsRoiExportingCsv] = useState(false);
+  const [isRoiExportingPdf, setIsRoiExportingPdf] = useState(false);
 
   const reasonCodes = parseReasonCodes(searchParams.get('reason_codes'));
   const prefillOutcome = parseProposalOutcome(searchParams.get('outcome'));
@@ -396,6 +485,252 @@ function ChangePageContent() {
                 ? 'Release completed. Keep rollback package available for incident response.'
                 : 'Change rolled back. Re-open investigation and prepare next proposal iteration.';
 
+  function buildRoiQueryString(format?: 'csv'): string {
+    const params = new URLSearchParams();
+    const start = isoRangeStart(roiStartDate);
+    const end = isoRangeEnd(roiEndDate);
+    if (start) params.set('start_time', start);
+    if (end) params.set('end_time', end);
+    if (format) params.set('format', format);
+    return params.toString();
+  }
+
+  async function fetchRoiArtifactsPayload(): Promise<RoiArtifacts> {
+    const query = buildRoiQueryString();
+    const path = query ? `/reports/roi-artifacts?${query}` : '/reports/roi-artifacts';
+    return api.get<RoiArtifacts>(path);
+  }
+
+  async function loadRoiArtifacts() {
+    setMessage('');
+    setErrorMessage('');
+    setIsRoiLoading(true);
+    try {
+      const payload = await fetchRoiArtifactsPayload();
+      setRoiArtifacts(payload);
+      pushToast({
+        title: 'ROI summary loaded',
+        description: 'KPI before/after summary, incidents, and change log are ready.',
+        variant: 'success'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load ROI artifacts';
+      setErrorMessage(message);
+      pushToast({ title: 'ROI load failed', description: message, variant: 'error' });
+    } finally {
+      setIsRoiLoading(false);
+    }
+  }
+
+  async function exportRoiCsv() {
+    setMessage('');
+    setErrorMessage('');
+    setIsRoiExportingCsv(true);
+    try {
+      const query = buildRoiQueryString('csv');
+      const token = typeof window !== 'undefined' ? localStorage.getItem('tt_token') : null;
+      const headers = new Headers();
+      if (token) {
+        headers.set('Authorization', `Bearer ${token}`);
+      }
+      const response = await fetch(`${API_BASE}/reports/roi-artifacts?${query}`, {
+        headers,
+        cache: 'no-store'
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { detail?: string };
+        throw new Error(body.detail || `Request failed: ${response.status}`);
+      }
+
+      const csvText = await response.text();
+      const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+      const objectUrl = URL.createObjectURL(blob);
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+      const filename = filenameMatch?.[1] || 'roi-artifacts.csv';
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(objectUrl);
+
+      setMessage('ROI CSV exported.');
+      pushToast({
+        title: 'ROI CSV exported',
+        description: `Saved ${filename}.`,
+        variant: 'success'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'CSV export failed';
+      setErrorMessage(message);
+      pushToast({ title: 'CSV export failed', description: message, variant: 'error' });
+    } finally {
+      setIsRoiExportingCsv(false);
+    }
+  }
+
+  async function exportRoiPdf() {
+    setMessage('');
+    setErrorMessage('');
+    setIsRoiExportingPdf(true);
+    try {
+      const payload = roiArtifacts ?? (await fetchRoiArtifactsPayload());
+      if (!roiArtifacts) {
+        setRoiArtifacts(payload);
+      }
+
+      const { jsPDF } = await import('jspdf');
+      const document = new jsPDF({ unit: 'pt', format: 'a4' });
+      const margin = 40;
+      const pageHeight = document.internal.pageSize.getHeight();
+      const pageWidth = document.internal.pageSize.getWidth();
+      const bodyLineHeight = 15;
+      const sectionSpacing = 8;
+      let cursorY = 48;
+
+      const ensureSpace = (requiredHeight = bodyLineHeight) => {
+        if (cursorY + requiredHeight <= pageHeight - margin) return;
+        document.addPage();
+        cursorY = margin;
+      };
+
+      const writeLine = (text: string, fontStyle: 'normal' | 'bold' = 'normal') => {
+        const lines = document.splitTextToSize(text, pageWidth - margin * 2) as string[];
+        ensureSpace(lines.length * bodyLineHeight + 2);
+        document.setFont('helvetica', fontStyle);
+        document.text(lines, margin, cursorY);
+        cursorY += lines.length * bodyLineHeight;
+      };
+
+      const writeSectionTitle = (title: string) => {
+        ensureSpace(22);
+        cursorY += sectionSpacing;
+        writeLine(title, 'bold');
+      };
+
+      const safeDelta = (value: number | undefined): number => value ?? 0;
+
+      writeLine('ROI Artifacts Report', 'bold');
+      writeLine(`Generated at: ${formatRoiDateLabel(payload.generated_at)}`);
+      writeLine(`Window start: ${formatRoiDateLabel(payload.window.start_time)}`);
+      writeLine(`Window end: ${formatRoiDateLabel(payload.window.end_time)}`);
+      writeLine(`Split point: ${formatRoiDateLabel(payload.window.split_time)}`);
+
+      writeSectionTitle('KPI before/after');
+      writeLine(
+        `Alert rate: ${payload.kpi_before.alert_rate_pct.toFixed(2)}% -> ${payload.kpi_after.alert_rate_pct.toFixed(2)}% (delta ${formatSignedPercent(safeDelta(payload.kpi_delta.alert_rate_pct_delta))})`
+      );
+      writeLine(
+        `Non-ALLOW rate: ${payload.kpi_before.non_allow_rate_pct.toFixed(2)}% -> ${payload.kpi_after.non_allow_rate_pct.toFixed(2)}% (delta ${formatSignedPercent(safeDelta(payload.kpi_delta.non_allow_rate_pct_delta))})`
+      );
+      writeLine(
+        `PPV proxy: ${payload.kpi_before.ppv_proxy_pct.toFixed(2)}% -> ${payload.kpi_after.ppv_proxy_pct.toFixed(2)}% (delta ${formatSignedPercent(safeDelta(payload.kpi_delta.ppv_proxy_pct_delta))})`
+      );
+      writeLine(
+        `Mean score: ${payload.kpi_before.mean_score.toFixed(2)} -> ${payload.kpi_after.mean_score.toFixed(2)} (delta ${safeDelta(payload.kpi_delta.mean_score_delta).toFixed(2)})`
+      );
+
+      writeSectionTitle(`Incidents (${payload.incidents.length})`);
+      if (payload.incidents.length === 0) {
+        writeLine('No incidents in selected window.');
+      } else {
+        payload.incidents.forEach((incident, index) => {
+          writeLine(
+            `${index + 1}. ${incident.title} | ${incident.status} | ${incident.severity} | ${incident.model_id} | ${formatRoiDateLabel(incident.created_at)}`
+          );
+        });
+      }
+
+      writeSectionTitle(`Change log (${payload.change_log.length})`);
+      if (payload.change_log.length === 0) {
+        writeLine('No changes in selected window.');
+      } else {
+        payload.change_log.forEach((change, index) => {
+          writeLine(
+            `${index + 1}. ${change.title} | ${change.status} | ${change.model_id} | threshold ${change.current_threshold} -> ${change.proposed_threshold} | ${formatRoiDateLabel(change.created_at)}`
+          );
+        });
+      }
+
+      const filename = `roi-artifacts-${payload.generated_at.replace(/[:.]/g, '-')}.pdf`;
+      document.save(filename);
+      setMessage('ROI PDF exported.');
+      pushToast({
+        title: 'ROI PDF exported',
+        description: `Saved ${filename}.`,
+        variant: 'success'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'PDF export failed';
+      setErrorMessage(message);
+      pushToast({ title: 'PDF export failed', description: message, variant: 'error' });
+    } finally {
+      setIsRoiExportingPdf(false);
+    }
+  }
+
+  async function exportCasePacket(change: Change) {
+    setMessage('');
+    setErrorMessage('');
+    setIsCasePacketExporting(true);
+    try {
+      const evidenceBundle = await api.get<Record<string, unknown>>(`/changes/${change.id}/package`);
+      let roiPayload: RoiArtifacts | null = roiArtifacts;
+      if (!roiPayload) {
+        try {
+          roiPayload = await fetchRoiArtifactsPayload();
+          setRoiArtifacts(roiPayload);
+        } catch {
+          roiPayload = null;
+        }
+      }
+
+      const packet: CasePacket = {
+        packet_type: 'case_packet',
+        generated_at: new Date().toISOString(),
+        change: {
+          id: change.id,
+          title: change.title,
+          model_id: change.model_id,
+          status: change.status,
+          current_threshold: change.current_threshold,
+          proposed_threshold: change.proposed_threshold
+        },
+        evidence_bundle: evidenceBundle,
+        roi_artifacts: roiPayload
+      };
+
+      const text = JSON.stringify(packet, null, 2);
+      const blob = new Blob([text], { type: 'application/json' });
+      const objectUrl = URL.createObjectURL(blob);
+      const timestamp = packet.generated_at.replace(/[:.]/g, '-');
+      const filename = `case-packet-${change.id}-${timestamp}.json`;
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(objectUrl);
+
+      setMessage('Case packet exported.');
+      pushToast({
+        title: 'Case packet exported',
+        description: roiPayload ? `Saved ${filename}.` : `Saved ${filename} without ROI snapshot.`,
+        variant: 'success'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Case packet export failed';
+      setErrorMessage(message);
+      pushToast({ title: 'Case packet export failed', description: message, variant: 'error' });
+    } finally {
+      setIsCasePacketExporting(false);
+    }
+  }
+
   if (loading) {
     return (
       <Card>
@@ -596,7 +931,7 @@ function ChangePageContent() {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Review → rollout → rollback path</CardTitle>
+          <CardTitle className="text-base">Review â rollout â rollback path</CardTitle>
           <CardDescription>Demonstrable control flow for quality/risk handoff and safe release.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
@@ -986,6 +1321,13 @@ function ChangePageContent() {
                     >
                       {isExporting ? 'Exporting...' : 'Export Change Package'}
                     </Button>
+                    <Button
+                      variant="outline"
+                      disabled={isCasePacketExporting}
+                      onClick={() => void exportCasePacket(selectedChange)}
+                    >
+                      {isCasePacketExporting ? 'Exporting case packet...' : 'Export Case Packet (One File)'}
+                    </Button>
                   </CardContent>
                 </Card>
               ) : (
@@ -1039,6 +1381,143 @@ function ChangePageContent() {
                 </Button>
               </div>
             </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>ROI Artifacts Export</CardTitle>
+          <CardDescription>KPI before/after plus incident and change log export for committee packet prep.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4 text-sm">
+          <div className="grid gap-3 md:grid-cols-[1fr_1fr_auto]">
+            <div className="space-y-1.5">
+              <Label htmlFor="roi-start-date">Start date</Label>
+              <Input
+                id="roi-start-date"
+                type="date"
+                value={roiStartDate}
+                onChange={(event) => setRoiStartDate(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="roi-end-date">End date</Label>
+              <Input
+                id="roi-end-date"
+                type="date"
+                value={roiEndDate}
+                onChange={(event) => setRoiEndDate(event.target.value)}
+              />
+            </div>
+            <div className="flex flex-wrap items-end gap-2">
+              <Button variant="outline" disabled={isRoiLoading} onClick={() => void loadRoiArtifacts()}>
+                {isRoiLoading ? 'Loading summary...' : 'Load Summary'}
+              </Button>
+              <Button variant="outline" disabled={isRoiExportingCsv} onClick={() => void exportRoiCsv()}>
+                {isRoiExportingCsv ? 'Exporting CSV...' : 'Export CSV'}
+              </Button>
+              <Button variant="outline" disabled={isRoiExportingPdf} onClick={() => void exportRoiPdf()}>
+                {isRoiExportingPdf ? 'Exporting PDF...' : 'Export PDF'}
+              </Button>
+              <Button
+                variant="outline"
+                disabled={!roiArtifacts}
+                onClick={() => {
+                  if (!roiArtifacts) return;
+                  const text = JSON.stringify(roiArtifacts, null, 2);
+                  const blob = new Blob([text], { type: 'application/json' });
+                  const objectUrl = URL.createObjectURL(blob);
+                  const anchor = document.createElement('a');
+                  anchor.href = objectUrl;
+                  anchor.download = `roi-artifacts-${roiArtifacts.generated_at.replace(/[:.]/g, '-')}.json`;
+                  document.body.appendChild(anchor);
+                  anchor.click();
+                  document.body.removeChild(anchor);
+                  URL.revokeObjectURL(objectUrl);
+                }}
+              >
+                Download JSON
+              </Button>
+            </div>
+          </div>
+
+          {roiArtifacts ? (
+            <>
+              <div className="rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                <p>Generated at: {new Date(roiArtifacts.generated_at).toLocaleString()}</p>
+                <p>Split point: {roiArtifacts.window.split_time ? new Date(roiArtifacts.window.split_time).toLocaleString() : '-'}</p>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-lg border border-border px-3 py-2">
+                  <p className="text-xs text-muted-foreground">Alert rate</p>
+                  <p className="font-medium">
+                    {roiArtifacts.kpi_before.alert_rate_pct.toFixed(2)}%{' -> '}{roiArtifacts.kpi_after.alert_rate_pct.toFixed(2)}%
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Delta {formatSignedPercent(roiArtifacts.kpi_delta.alert_rate_pct_delta || 0)}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-border px-3 py-2">
+                  <p className="text-xs text-muted-foreground">Non-ALLOW rate</p>
+                  <p className="font-medium">
+                    {roiArtifacts.kpi_before.non_allow_rate_pct.toFixed(2)}%{' -> '}{roiArtifacts.kpi_after.non_allow_rate_pct.toFixed(2)}%
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Delta {formatSignedPercent(roiArtifacts.kpi_delta.non_allow_rate_pct_delta || 0)}
+                  </p>
+                </div>
+                <div className="rounded-lg border border-border px-3 py-2">
+                  <p className="text-xs text-muted-foreground">PPV proxy</p>
+                  <p className="font-medium">
+                    {roiArtifacts.kpi_before.ppv_proxy_pct.toFixed(2)}%{' -> '}{roiArtifacts.kpi_after.ppv_proxy_pct.toFixed(2)}%
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Delta {formatSignedPercent(roiArtifacts.kpi_delta.ppv_proxy_pct_delta || 0)}
+                  </p>
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Incidents</p>
+                  {roiArtifacts.incidents.length === 0 ? (
+                    <p className="mt-2 text-xs text-muted-foreground">No incidents in selected window.</p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {roiArtifacts.incidents.slice(0, 4).map((incident) => (
+                        <div key={incident.id} className="rounded border border-border bg-muted/40 px-2 py-1">
+                          <p className="font-medium">{incident.title}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {incident.status} | {incident.severity} | {incident.model_id}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="rounded-lg border border-border p-3">
+                  <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Change log</p>
+                  {roiArtifacts.change_log.length === 0 ? (
+                    <p className="mt-2 text-xs text-muted-foreground">No changes in selected window.</p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {roiArtifacts.change_log.slice(0, 4).map((change) => (
+                        <div key={change.id} className="rounded border border-border bg-muted/40 px-2 py-1">
+                          <p className="font-medium">{change.title}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {change.status} | Threshold {change.current_threshold}{' -> '}{change.proposed_threshold}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Load summary to preview KPI before/after and verify export payload before committee handoff.
+            </p>
           )}
         </CardContent>
       </Card>
