@@ -92,6 +92,21 @@ type RoiArtifacts = {
   }>;
 };
 
+type CasePacket = {
+  packet_type: 'case_packet';
+  generated_at: string;
+  change: {
+    id: string;
+    title: string;
+    model_id: string;
+    status: string;
+    current_threshold: number;
+    proposed_threshold: number;
+  };
+  evidence_bundle: Record<string, unknown>;
+  roi_artifacts: RoiArtifacts | null;
+};
+
 type ProposalOutcome = 'ALLOW' | 'CAUTION' | 'ABSTAIN' | 'HOLD';
 
 const transitionTargets = ['Review', 'Approved', 'Canary', 'Released', 'RolledBack'];
@@ -223,6 +238,7 @@ function ChangePageContent() {
   const [isSimulating, setIsSimulating] = useState(false);
   const [transitioningTo, setTransitioningTo] = useState<string>('');
   const [isExporting, setIsExporting] = useState(false);
+  const [isCasePacketExporting, setIsCasePacketExporting] = useState(false);
   const [roiStartDate, setRoiStartDate] = useState(() => dateInputValue(-30));
   const [roiEndDate, setRoiEndDate] = useState(() => dateInputValue(0));
   const [roiArtifacts, setRoiArtifacts] = useState<RoiArtifacts | null>(null);
@@ -653,6 +669,65 @@ function ChangePageContent() {
       pushToast({ title: 'PDF export failed', description: message, variant: 'error' });
     } finally {
       setIsRoiExportingPdf(false);
+    }
+  }
+
+  async function exportCasePacket(change: Change) {
+    setMessage('');
+    setErrorMessage('');
+    setIsCasePacketExporting(true);
+    try {
+      const evidenceBundle = await api.get<Record<string, unknown>>(`/changes/${change.id}/package`);
+      let roiPayload: RoiArtifacts | null = roiArtifacts;
+      if (!roiPayload) {
+        try {
+          roiPayload = await fetchRoiArtifactsPayload();
+          setRoiArtifacts(roiPayload);
+        } catch {
+          roiPayload = null;
+        }
+      }
+
+      const packet: CasePacket = {
+        packet_type: 'case_packet',
+        generated_at: new Date().toISOString(),
+        change: {
+          id: change.id,
+          title: change.title,
+          model_id: change.model_id,
+          status: change.status,
+          current_threshold: change.current_threshold,
+          proposed_threshold: change.proposed_threshold
+        },
+        evidence_bundle: evidenceBundle,
+        roi_artifacts: roiPayload
+      };
+
+      const text = JSON.stringify(packet, null, 2);
+      const blob = new Blob([text], { type: 'application/json' });
+      const objectUrl = URL.createObjectURL(blob);
+      const timestamp = packet.generated_at.replace(/[:.]/g, '-');
+      const filename = `case-packet-${change.id}-${timestamp}.json`;
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(objectUrl);
+
+      setMessage('Case packet exported.');
+      pushToast({
+        title: 'Case packet exported',
+        description: roiPayload ? `Saved ${filename}.` : `Saved ${filename} without ROI snapshot.`,
+        variant: 'success'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Case packet export failed';
+      setErrorMessage(message);
+      pushToast({ title: 'Case packet export failed', description: message, variant: 'error' });
+    } finally {
+      setIsCasePacketExporting(false);
     }
   }
 
@@ -1245,6 +1320,13 @@ function ChangePageContent() {
                       }}
                     >
                       {isExporting ? 'Exporting...' : 'Export Change Package'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={isCasePacketExporting}
+                      onClick={() => void exportCasePacket(selectedChange)}
+                    >
+                      {isCasePacketExporting ? 'Exporting case packet...' : 'Export Case Packet (One File)'}
                     </Button>
                   </CardContent>
                 </Card>
