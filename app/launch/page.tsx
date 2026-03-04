@@ -52,8 +52,14 @@ export default function LaunchPage() {
             model output can run, when it should pause, and how to document every decision path with audit-ready evidence.
           </p>
           <div className="mt-6 flex flex-wrap gap-3">
+            <Link href="/launch/product">
+              <Button>Product overview</Button>
+            </Link>
+            <Link href="/launch/docs">
+              <Button variant="outline">Docs overview</Button>
+            </Link>
             <Link href="/launch/pilot-pack">
-              <Button>View pilot pack</Button>
+              <Button variant="outline">View pilot pack</Button>
             </Link>
             <Link href="/demo-mode">
               <Button variant="outline">Open in-product demo mode</Button>
@@ -158,6 +164,12 @@ export default function LaunchPage() {
             Canonical sequence source: `docs/DEMO_RUNBOOK.md` (HOLD to ABSTAIN to CAUTION to SMART).
           </p>
           <div className="mt-5 flex flex-wrap gap-3">
+            <Link href="/launch/product">
+              <Button variant="outline">Open product overview</Button>
+            </Link>
+            <Link href="/launch/docs">
+              <Button variant="outline">Open docs overview</Button>
+            </Link>
             <Link href="/launch/demo-kit">
               <Button variant="outline">Open demo kit route</Button>
             </Link>
